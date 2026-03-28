@@ -45,6 +45,9 @@ from typing import Any
 
 from rich.console import Console
 
+from scrapers import github as github_scraper
+from scrapers import social as social_scraper
+
 RICH = Console()
 
 COMPETITORS = [
@@ -69,6 +72,27 @@ COMPETITORS = [
 ]
 
 
+def _extract_social_summary(social_result: dict) -> dict:
+    """Distil a social.scrape() result into the compact summary used in the benchmark table."""
+    # mentions_7d: sum post_count for the most recent week bucket
+    mentions_7d = 0
+    weekly = social_result.get("weekly_volumes", [])
+    if weekly:
+        # Last entry in the list is the most recent week
+        most_recent = weekly[-1]
+        mentions_7d = most_recent.get("post_count", 0)
+
+    sentiment = social_result.get("sentiment", {})
+    sentiment_ratio = sentiment.get("ratio")
+
+    return {
+        "mentions_7d": mentions_7d,
+        "sentiment_ratio": sentiment_ratio,
+        "nitter_unavailable": social_result.get("nitter_unavailable", False),
+        "notes": social_result.get("notes", []),
+    }
+
+
 async def scrape() -> dict[str, Any]:
     """Collect GitHub and social benchmark metrics for all competitor projects.
 
@@ -79,4 +103,69 @@ async def scrape() -> dict[str, Any]:
     Returns a structured dict with per-competitor results and a comparison
     table ready for the report generator.
     """
-    raise NotImplementedError("Competitors scraper not yet implemented — scaffold only.")
+    fetched_at = datetime.now(timezone.utc).isoformat()
+    notes: list[str] = []
+    competitor_results: list[dict] = []
+
+    for comp in COMPETITORS:
+        name = comp["name"]
+        github_org = comp["github_org"]
+        twitter_handle = comp["twitter_handle"]
+        twitter_search = comp["twitter_search"]
+
+        RICH.print(f"[cyan][competitors] Processing {name}...[/]")
+
+        comp_error: str | None = None
+        github_result: dict | None = None
+        social_result: dict | None = None
+
+        # --- GitHub ---
+        try:
+            raw_github = await github_scraper.scrape(org=github_org, max_repos=15)
+            if "error" in raw_github:
+                github_result = {"error": raw_github["error"], "aggregates": {}}
+                notes.append(f"{name} GitHub: {raw_github['error']}")
+            else:
+                github_result = {
+                    "aggregates": raw_github.get("aggregates", {}),
+                    "repo_count": len(raw_github.get("repos", [])),
+                }
+        except Exception as exc:
+            err_msg = f"GitHub scrape failed for {name}: {exc}"
+            RICH.print(f"[red][competitors] {err_msg}[/]")
+            notes.append(err_msg)
+            github_result = {"error": str(exc), "aggregates": {}}
+
+        # --- Social ---
+        try:
+            raw_social = await social_scraper.scrape(queries=[twitter_search])
+            social_result = _extract_social_summary(raw_social)
+        except Exception as exc:
+            err_msg = f"Social scrape failed for {name}: {exc}"
+            RICH.print(f"[red][competitors] {err_msg}[/]")
+            notes.append(err_msg)
+            social_result = {
+                "mentions_7d": None,
+                "sentiment_ratio": None,
+                "nitter_unavailable": True,
+                "notes": [str(exc)],
+            }
+
+        competitor_results.append(
+            {
+                "name": name,
+                "github_org": github_org,
+                "twitter_handle": twitter_handle,
+                "github": github_result,
+                "social": social_result,
+                "error": comp_error,
+            }
+        )
+
+        RICH.print(f"[cyan][competitors] Done with {name}[/]")
+
+    return {
+        "competitors": competitor_results,
+        "fetched_at": fetched_at,
+        "notes": notes,
+    }
