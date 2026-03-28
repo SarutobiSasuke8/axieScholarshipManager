@@ -1,0 +1,13 @@
+# teneo-intel dependencies
+# Python 3.11+ required
+
+httpx[http2]==0.27.0          # async HTTP client for all requests
+beautifulsoup4==4.12.3        # HTML parsing for console, docs, social scrapers
+lxml==5.2.2                   # fast BS4 parser backend (optional but faster than html.parser)
+rich==13.7.1                  # terminal progress indicators and styled output
+python-dateutil==2.9.0        # flexible timestamp parsing (last-updated dates, git commits)
+
+# Dev / testing (optional — not required for production runs)
+# pytest==8.2.0
+# pytest-asyncio==0.23.7
+# respx==0.21.1               # mock httpx in tests

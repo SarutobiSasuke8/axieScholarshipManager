@@ -1,0 +1,16 @@
+# teneo-intel local data — snapshots stay local, never committed
+data/*.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Generated reports (optional — remove if you want reports in git)
+ecosystem_audit_*.md
+
+# Environment
+.env
