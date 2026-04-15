@@ -1,6 +1,9 @@
 # teneo-intel local data — snapshots stay local, never committed
 data/*.json
 
+# Claude Code internal directory (empty stubs, no user content)
+.claude/
+
 # Python
 __pycache__/
 *.py[cod]
