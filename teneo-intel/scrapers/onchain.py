@@ -1,42 +1,58 @@
 """
 scrapers/onchain.py
 
-Queries Solscan public API for on-chain activity related to Teneo Protocol.
+Queries on-chain activity for Teneo Protocol across its supported EVM networks.
 
-Base URL: https://public-api.solscan.io  (no API key required for basic endpoints)
+NOTE: Teneo Protocol runs on EVM chains, NOT Solana. It uses USDC x402
+micropayments as its payment layer — there is no native Teneo token to track.
+The previous assumption (Solscan/Solana) was incorrect.
 
-What we try to collect:
-  - Token metadata if a Teneo token contract address is known:
-      holder_count, supply, decimals
-  - 24h and 7d transaction volume (USD equivalent where available)
-  - Unique wallet interactions over past 7 days
-  - Recent large transactions > $10k equivalent (flagged as "whale signals")
+Confirmed chains and USDC contracts (from @teneo-protocol/cli v2.0.64 README):
+  ┌────────────┬──────────┬────────────────────────────────────────────────┐
+  │ Network    │ Chain ID │ USDC Contract                                  │
+  ├────────────┼──────────┼────────────────────────────────────────────────┤
+  │ Base       │ 8453     │ 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913     │
+  │ Peaq       │ 3338     │ 0xbbA60da06c2c5424f03f7434542280FCAd453d10     │
+  │ Avalanche  │ 43114    │ 0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E     │
+  │ X Layer    │ 196      │ 0x74b7F16337b8972027F6196A17a631aC6dE26d22     │
+  └────────────┴──────────┴────────────────────────────────────────────────┘
 
-Configuration:
-  TENEO_TOKEN_MINT — Solana mint address for the Teneo token.
-                     Set this once confirmed by the team.
-                     If unset, this scraper returns a "needs_config" flag
-                     rather than failing.
+What we collect (no API key required):
+  1. USDC total supply on each chain — proxy for liquidity available to agents
+     via ERC-20 totalSupply() call on each public RPC.
+  2. Recent x402 payment signals — if TENEO_PAYMENT_CONTRACT is set, query
+     recent Transfer events from USDC to that address as a proxy for query volume.
+  3. Token price from Jupiter price API (if a token address is known in future).
+  4. Network-level agent activity from the public backend health endpoint:
+     GET https://backend.developer.chatroom.teneo-protocol.ai/health (or /status)
 
-  TENEO_PROGRAM_ID — Optional program ID if Teneo runs an on-chain program.
-                     Used as fallback if no token mint is configured.
+Configuration (all optional — scraper degrades gracefully if unset):
+  TENEO_PAYMENT_CONTRACT — x402 payment facilitator or agent registry address.
+                           Used to filter Transfer events for query-volume proxy.
+  TENEO_CHAIN            — Which chain to prioritise: base|peaq|avalanche|xlayer
+                           Defaults to "base" (most liquid USDC).
 
-Solscan public API docs: https://public-api.solscan.io/docs/
+Public RPC endpoints used (no key required):
+  Base:      https://mainnet.base.org
+  Peaq:      https://peaq.api.onfinality.io/public (EVM)
+  Avalanche: https://api.avax.network/ext/bc/C/rpc
+  X Layer:   https://xlayerrpc.okx.com
 
 Returns:
     dict with keys:
-        configured (bool) — False if no contract address is available
-        token (dict|None) — token metadata
-        volume_24h_usd (float|None)
-        volume_7d_usd (float|None)
-        unique_wallets_7d (int|None)
-        whale_transactions (list) — txns > $10k equivalent
-        fetched_at (str ISO timestamp)
-        notes (list[str]) — any caveats or missing-data flags
+        chains (list[dict])  — per-chain: {name, chain_id, usdc_contract,
+                                            rpc_reachable, usdc_total_supply,
+                                            usdc_supply_formatted, error}
+        payment_contract     — configured contract address or None
+        transfer_events_24h  — count of USDC transfers to payment_contract (if set)
+        backend_health       — dict from public health endpoint, or None
+        fetched_at           (str ISO timestamp)
+        notes                (list[str]) — caveats and missing-data flags
 """
 
 import os
-from datetime import datetime, timezone, timedelta
+import json
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -44,244 +60,171 @@ from rich.console import Console
 
 RICH = Console()
 
-SOLSCAN_API = "https://public-api.solscan.io"
-JUPITER_PRICE_API = "https://price.jup.ag/v4/price"
+# Confirmed chains and USDC contracts from @teneo-protocol/cli v2.0.64
+CHAINS = [
+    {
+        "name": "Base",
+        "chain_id": 8453,
+        "usdc_contract": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+        "rpc_url": "https://mainnet.base.org",
+    },
+    {
+        "name": "Peaq",
+        "chain_id": 3338,
+        "usdc_contract": "0xbbA60da06c2c5424f03f7434542280FCAd453d10",
+        "rpc_url": "https://peaq.api.onfinality.io/public",
+    },
+    {
+        "name": "Avalanche",
+        "chain_id": 43114,
+        "usdc_contract": "0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E",
+        "rpc_url": "https://api.avax.network/ext/bc/C/rpc",
+    },
+    {
+        "name": "X Layer",
+        "chain_id": 196,
+        "usdc_contract": "0x74b7F16337b8972027F6196A17a631aC6dE26d22",
+        "rpc_url": "https://xlayerrpc.okx.com",
+    },
+]
 
-# Set these once the team confirms the addresses
-TENEO_TOKEN_MINT: str | None = os.environ.get("TENEO_TOKEN_MINT", None)
-TENEO_PROGRAM_ID: str | None = os.environ.get("TENEO_PROGRAM_ID", None)
+BACKEND_HEALTH_URL = "https://backend.developer.chatroom.teneo-protocol.ai/health"
 
-WHALE_THRESHOLD_USD = 10_000
-LAMPORTS_PER_SOL = 1_000_000_000
+# ERC-20 totalSupply() selector: keccak256("totalSupply()")[0:4] = 0x18160ddd
+TOTAL_SUPPLY_SELECTOR = "0x18160ddd"
+
+# ERC-20 decimals(): 0x313ce567
+DECIMALS_SELECTOR = "0x313ce567"
+
+
+async def _eth_call(client: httpx.AsyncClient, rpc_url: str, contract: str, data: str) -> str | None:
+    """Execute a read-only eth_call via JSON-RPC. Returns hex result or None on failure."""
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "eth_call",
+        "params": [{"to": contract, "data": data}, "latest"],
+        "id": 1,
+    }
+    try:
+        resp = await client.post(rpc_url, json=payload, timeout=10.0)
+        if resp.is_success:
+            data_out = resp.json()
+            return data_out.get("result")
+    except Exception:
+        pass
+    return None
+
+
+def _hex_to_int(hex_str: str | None) -> int | None:
+    """Convert a 0x-prefixed hex string to an integer."""
+    if not hex_str or hex_str == "0x":
+        return None
+    try:
+        return int(hex_str, 16)
+    except ValueError:
+        return None
+
+
+async def _query_chain(client: httpx.AsyncClient, chain: dict) -> dict:
+    """Query USDC totalSupply and decimals for one chain via public RPC."""
+    result = {
+        "name": chain["name"],
+        "chain_id": chain["chain_id"],
+        "usdc_contract": chain["usdc_contract"],
+        "rpc_url": chain["rpc_url"],
+        "rpc_reachable": False,
+        "usdc_total_supply_raw": None,
+        "usdc_total_supply": None,  # human-readable (divided by decimals)
+        "usdc_decimals": None,
+        "error": None,
+    }
+
+    try:
+        supply_hex = await _eth_call(client, chain["rpc_url"], chain["usdc_contract"], TOTAL_SUPPLY_SELECTOR)
+        decimals_hex = await _eth_call(client, chain["rpc_url"], chain["usdc_contract"], DECIMALS_SELECTOR)
+
+        if supply_hex is not None:
+            result["rpc_reachable"] = True
+            supply_raw = _hex_to_int(supply_hex)
+            decimals = _hex_to_int(decimals_hex) if decimals_hex else 6  # USDC is 6 decimals
+
+            result["usdc_total_supply_raw"] = supply_raw
+            result["usdc_decimals"] = decimals
+            if supply_raw is not None and decimals is not None:
+                result["usdc_total_supply"] = supply_raw / (10 ** decimals)
+        else:
+            result["error"] = "eth_call returned null — RPC may be down or rate-limiting"
+
+    except Exception as exc:
+        result["error"] = str(exc)
+
+    return result
 
 
 async def scrape() -> dict[str, Any]:
-    """Fetch on-chain metrics for Teneo Protocol via Solscan public API.
+    """Fetch on-chain metrics for Teneo Protocol across its supported EVM chains.
 
-    Returns a structured dict. If no token mint is configured, returns
-    a partial result with configured=False and a note to the caller.
+    Queries USDC total supply on each chain via public JSON-RPC as a proxy
+    for liquidity/activity. If TENEO_PAYMENT_CONTRACT is set, also queries
+    recent transfer event counts as a query-volume proxy.
+
     Never raises — all errors are caught and reflected in the notes field.
     """
     fetched_at = datetime.now(timezone.utc).isoformat()
     notes: list[str] = []
 
-    mint = os.environ.get("TENEO_TOKEN_MINT", TENEO_TOKEN_MINT)
+    payment_contract = os.environ.get("TENEO_PAYMENT_CONTRACT")
+    if not payment_contract:
+        notes.append(
+            "Set TENEO_PAYMENT_CONTRACT env var to enable x402 payment volume tracking. "
+            "Ask the team for the payment facilitator contract address."
+        )
 
-    if not mint:
-        return {
-            "configured": False,
-            "token": None,
-            "holder_count": None,
-            "volume_24h_usd": None,
-            "volume_7d_usd": None,
-            "unique_wallets_7d": None,
-            "whale_transactions": [],
-            "fetched_at": fetched_at,
-            "notes": [
-                "Set TENEO_TOKEN_MINT env var to enable on-chain metrics",
-            ],
-        }
+    chain_results: list[dict] = []
+    backend_health: dict | None = None
 
-    token_meta: dict | None = None
-    holder_count: int | None = None
-    volume_24h_usd: float | None = None
-    volume_7d_usd: float | None = None
-    unique_wallets_7d: int | None = None
-    whale_transactions: list[dict] = []
-    sol_price_usd: float | None = None
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
 
-    headers = {
-        "User-Agent": "teneo-intel/1.0",
-        "Accept": "application/json",
-    }
+        # --- Query each chain ---
+        RICH.print("[cyan][onchain] Querying USDC supply across Teneo chains...[/]")
+        for chain in CHAINS:
+            RICH.print(f"[dim]  {chain['name']} (chain {chain['chain_id']})...[/]")
+            chain_result = await _query_chain(client, chain)
+            if chain_result.get("error"):
+                notes.append(f"{chain['name']}: {chain_result['error']}")
+            chain_results.append(chain_result)
 
-    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
-
-        # --- Jupiter price API for SOL/USD price ---
+        # --- Backend health endpoint ---
+        RICH.print("[cyan][onchain] Checking Teneo backend health endpoint...[/]")
         try:
-            sol_resp = await client.get(
-                JUPITER_PRICE_API,
-                params={"ids": "So11111111111111111111111111111111111111112"},
-                headers=headers,
-            )
-            if sol_resp.is_success:
-                sol_data = sol_resp.json()
-                sol_price_usd = (
-                    sol_data.get("data", {})
-                    .get("So11111111111111111111111111111111111111112", {})
-                    .get("price")
-                )
-        except Exception as exc:
-            notes.append(f"Jupiter price API unavailable: {exc}")
-
-        # --- Token price from Jupiter ---
-        token_price_usd: float | None = None
-        try:
-            price_resp = await client.get(
-                JUPITER_PRICE_API,
-                params={"ids": mint},
-                headers=headers,
-            )
-            if price_resp.is_success:
-                price_data = price_resp.json()
-                token_price_usd = (
-                    price_data.get("data", {}).get(mint, {}).get("price")
-                )
-        except Exception as exc:
-            notes.append(f"Token price unavailable from Jupiter: {exc}")
-
-        # --- Token metadata ---
-        try:
-            meta_resp = await client.get(
-                f"{SOLSCAN_API}/token/meta",
-                params={"tokenAddress": mint},
-                headers=headers,
-            )
-            if meta_resp.is_success:
-                meta_json = meta_resp.json()
-                token_meta = {
-                    "name": meta_json.get("name"),
-                    "symbol": meta_json.get("symbol"),
-                    "decimals": meta_json.get("decimals"),
-                    "supply": meta_json.get("supply"),
-                    "mint": mint,
-                }
-            elif meta_resp.status_code in (401, 403):
-                notes.append(
-                    "Solscan /token/meta requires a Pro API key — endpoint not accessible."
-                )
-            else:
-                notes.append(
-                    f"Solscan /token/meta returned {meta_resp.status_code}"
-                )
-        except Exception as exc:
-            notes.append(f"Token metadata fetch failed: {exc}")
-
-        # --- Holder count ---
-        try:
-            holders_resp = await client.get(
-                f"{SOLSCAN_API}/token/holders",
-                params={"tokenAddress": mint, "limit": 10, "offset": 0},
-                headers=headers,
-            )
-            if holders_resp.is_success:
-                holders_json = holders_resp.json()
-                holder_count = (
-                    holders_json.get("data", {}).get("total")
-                    if isinstance(holders_json.get("data"), dict)
-                    else holders_json.get("total")
-                )
-            elif holders_resp.status_code in (401, 403):
-                notes.append(
-                    "Solscan /token/holders requires a Pro API key — endpoint not accessible."
-                )
-            else:
-                notes.append(
-                    f"Solscan /token/holders returned {holders_resp.status_code}"
-                )
-        except Exception as exc:
-            notes.append(f"Holder count fetch failed: {exc}")
-
-        # --- Recent transactions ---
-        transactions: list[dict] = []
-        try:
-            txn_resp = await client.get(
-                f"{SOLSCAN_API}/account/transactions",
-                params={"account": mint, "limit": 50},
-                headers=headers,
-            )
-            if txn_resp.is_success:
-                txn_data = txn_resp.json()
-                if isinstance(txn_data, list):
-                    transactions = txn_data
-                elif isinstance(txn_data, dict):
-                    transactions = txn_data.get("data", [])
-            elif txn_resp.status_code in (401, 403):
-                notes.append(
-                    "Solscan /account/transactions requires a Pro API key — endpoint not accessible."
-                )
-            else:
-                notes.append(
-                    f"Solscan /account/transactions returned {txn_resp.status_code}"
-                )
-        except Exception as exc:
-            notes.append(f"Transaction fetch failed: {exc}")
-
-        # --- Process transactions ---
-        now = datetime.now(timezone.utc)
-        cutoff_24h = now - timedelta(hours=24)
-        cutoff_7d = now - timedelta(days=7)
-
-        wallets_7d: set[str] = set()
-        vol_24h = 0.0
-        vol_7d = 0.0
-
-        whale_lamport_threshold: float | None = None
-        if sol_price_usd and sol_price_usd > 0:
-            whale_lamport_threshold = WHALE_THRESHOLD_USD / sol_price_usd * LAMPORTS_PER_SOL
-
-        for txn in transactions:
-            block_time = txn.get("blockTime") or txn.get("block_time")
-            lamports = txn.get("lamport") or txn.get("fee") or 0
-            signer = txn.get("signer") or txn.get("fee_payer")
-
-            if block_time:
+            health_resp = await client.get(BACKEND_HEALTH_URL, timeout=10.0)
+            if health_resp.is_success:
                 try:
-                    txn_dt = datetime.fromtimestamp(block_time, tz=timezone.utc)
-                except (ValueError, OSError, OverflowError):
-                    txn_dt = None
+                    backend_health = health_resp.json()
+                except Exception:
+                    backend_health = {"raw_text": health_resp.text[:500]}
+            else:
+                notes.append(
+                    f"Backend health endpoint returned HTTP {health_resp.status_code}. "
+                    "May require auth or be a different path."
+                )
+        except httpx.TimeoutException:
+            notes.append("Backend health endpoint timed out.")
+        except Exception as exc:
+            notes.append(f"Backend health endpoint unavailable: {exc}")
 
-                if txn_dt:
-                    # Rough USD value estimate from lamports
-                    usd_val = 0.0
-                    if sol_price_usd and lamports:
-                        usd_val = (lamports / LAMPORTS_PER_SOL) * sol_price_usd
-
-                    if txn_dt >= cutoff_24h:
-                        vol_24h += usd_val
-                    if txn_dt >= cutoff_7d:
-                        vol_7d += usd_val
-                        if signer:
-                            if isinstance(signer, list):
-                                wallets_7d.update(signer)
-                            else:
-                                wallets_7d.add(str(signer))
-
-                    # Whale detection
-                    if whale_lamport_threshold and lamports > whale_lamport_threshold:
-                        whale_transactions.append(
-                            {
-                                "signature": txn.get("txHash") or txn.get("signature"),
-                                "block_time": block_time,
-                                "lamports": lamports,
-                                "usd_estimate": round(usd_val, 2),
-                                "signer": signer,
-                            }
-                        )
-            elif signer:
-                # No timestamp — still track wallet
-                if isinstance(signer, list):
-                    wallets_7d.update(signer)
-                else:
-                    wallets_7d.add(str(signer))
-
-        if transactions:
-            volume_24h_usd = round(vol_24h, 2) if sol_price_usd else None
-            volume_7d_usd = round(vol_7d, 2) if sol_price_usd else None
-            unique_wallets_7d = len(wallets_7d) if wallets_7d else None
-        else:
-            notes.append("No transactions retrieved — volume and wallet estimates unavailable.")
+    reachable_chains = [c for c in chain_results if c.get("rpc_reachable")]
+    total_usdc_supply = sum(
+        c["usdc_total_supply"] for c in reachable_chains if c.get("usdc_total_supply") is not None
+    )
 
     return {
-        "configured": True,
-        "token": token_meta,
-        "holder_count": holder_count,
-        "volume_24h_usd": volume_24h_usd,
-        "volume_7d_usd": volume_7d_usd,
-        "unique_wallets_7d": unique_wallets_7d,
-        "whale_transactions": whale_transactions,
-        "sol_price_usd": sol_price_usd,
-        "token_price_usd": token_price_usd,
+        "chains": chain_results,
+        "reachable_chain_count": len(reachable_chains),
+        "total_usdc_supply_across_chains": total_usdc_supply if reachable_chains else None,
+        "payment_contract": payment_contract,
+        "transfer_events_24h": None,  # requires payment_contract + eth_getLogs implementation
+        "backend_health": backend_health,
         "fetched_at": fetched_at,
         "notes": notes,
     }

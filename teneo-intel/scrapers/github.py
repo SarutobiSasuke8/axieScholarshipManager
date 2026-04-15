@@ -40,7 +40,7 @@ from rich.progress import track
 RICH = Console()
 
 GITHUB_API = "https://api.github.com"
-ORG = "TeneoProtocol"  # TODO: confirm exact org slug with team
+ORG = "TeneoProtocolAI"  # Confirmed from @teneo-protocol/cli package.json repository field
 
 
 def _headers() -> dict:

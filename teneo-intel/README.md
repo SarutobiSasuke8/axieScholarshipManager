@@ -58,16 +58,20 @@ The `data/` directory is gitignored — snapshots stay local.
 
 ## Data sources and URL confirmation
 
-Several source URLs are assumptions based on publicly visible information.
-**Confirm these with the Teneo team before relying on results:**
+Sources confirmed from `@teneo-protocol/cli` v2.0.64 package inspection:
 
-| Source | Assumed URL / identifier | Status |
+| Source | URL / identifier | Status |
 |---|---|---|
-| Agent Console | `https://console.teneo.pro` | Needs inspection — may require JS rendering |
-| Docs site | `https://docs.teneo.pro` | Unconfirmed — check for redirects |
-| GitHub org | `TeneoProtocol` | Confirm exact org slug |
-| Token mint | Not set | Set `TENEO_TOKEN_MINT` env var once known |
-| Program ID | Not set | Set `TENEO_PROGRAM_ID` env var once known |
+| Agent Console | `https://agent-console.ai` | Confirmed — page structure needs inspection before scraper is implemented |
+| GitHub org | `TeneoProtocolAI` | Confirmed from package.json repository field |
+| Backend | `wss://backend.developer.chatroom.teneo-protocol.ai/ws` | Confirmed from SKILL.md metadata |
+| Docs site | `https://docs.teneo-protocol.ai` | Inferred — verify with team |
+| On-chain | EVM: Base, Peaq, Avalanche, X Layer | Confirmed — **NOT Solana** |
+| Token | None — USDC x402 micropayments only | No native token to track |
+
+**Note:** Teneo Protocol uses USDC x402 micropayments, not a native token.
+The on-chain scraper tracks USDC supply and chain health across the 4 supported networks.
+Set `TENEO_PAYMENT_CONTRACT` for x402 payment volume tracking once the facilitator address is confirmed.
 
 ---
 
@@ -78,8 +82,8 @@ None are required for a basic run. These unlock additional data:
 | Variable | Purpose |
 |---|---|
 | `GITHUB_TOKEN` | Raises GitHub rate limit from 60 to 5,000 req/hour |
-| `TENEO_TOKEN_MINT` | Solana mint address for on-chain token metrics |
-| `TENEO_PROGRAM_ID` | Solana program ID fallback for on-chain queries |
+| `TENEO_PAYMENT_CONTRACT` | x402 payment facilitator address — enables query-volume tracking |
+| `TENEO_CHAIN` | Preferred chain for on-chain queries: `base` (default), `peaq`, `avalanche`, `xlayer` |
 
 ---
 

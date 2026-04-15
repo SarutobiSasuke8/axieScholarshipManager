@@ -3,7 +3,9 @@ scrapers/console.py
 
 Scrapes the Teneo Agent Console for publicly listed agent data.
 
-Target URL: https://console.teneo.pro
+Target URL: https://agent-console.ai
+  Confirmed from @teneo-protocol/cli README (v2.0.64):
+    "Agent Console: https://agent-console.ai"
 
 NOTE: The actual structure of this page is unknown until we inspect it at
 runtime. This scraper is intentionally left as a stub. Before implementing,
@@ -12,16 +14,19 @@ run:
     python -c "
     import httpx, asyncio
     async def peek():
-        async with httpx.AsyncClient() as c:
-            r = await c.get('https://console.teneo.pro', follow_redirects=True)
+        async with httpx.AsyncClient(follow_redirects=True) as c:
+            r = await c.get('https://agent-console.ai')
             print(r.status_code, r.headers.get('content-type'))
             print(r.text[:3000])
     asyncio.run(peek())
     "
 
-…and review the rendered HTML (or check for a JSON API) before writing
-any parsing logic. The implementation will be filled in after reviewing
-the real page structure.
+The CLI also exposes a machine-readable agent manifest via:
+    ~/teneo-skill/teneo discover --json
+    ~/teneo-skill/teneo list-agents --json
+
+If the web console returns a JS bundle, the CLI manifest is the preferred
+data source — it is structured JSON and doesn't require a browser.
 
 What we intend to collect (adjust once page is inspected):
   - Total number of publicly listed agents
@@ -47,11 +52,11 @@ from rich.console import Console
 
 RICH = Console()
 
-CONSOLE_URL = "https://console.teneo.pro"
+CONSOLE_URL = "https://agent-console.ai"  # Confirmed from @teneo-protocol/cli v2.0.64
 
 
 async def scrape() -> dict[str, Any]:
-    """Scrape the Teneo Agent Console.
+    """Scrape the Teneo Agent Console at https://agent-console.ai.
 
     IMPORTANT: Inspect the real page structure before implementing.
     See module docstring for the inspection command.
@@ -60,5 +65,7 @@ async def scrape() -> dict[str, Any]:
     """
     raise NotImplementedError(
         "Console scraper not yet implemented — page structure must be inspected first. "
-        "See module docstring for the inspection command."
+        "See module docstring for the inspection command.\n"
+        "Alternative: use the Teneo CLI 'discover --json' or 'list-agents --json' "
+        "for a structured agent manifest without needing to parse HTML."
     )
