@@ -152,7 +152,7 @@ _METRICS = [
     ("github.aggregates.commits_30d",         ("github", "aggregates", "commits_30d"),          True),
     ("github.aggregates.unique_contributors_90d", ("github", "aggregates", "unique_contributors_90d"), True),
     ("github.aggregates.total_open_issues",   ("github", "aggregates", "total_open_issues"),   False),
-    ("onchain.holder_count",                  ("onchain", "holder_count"),                     True),
+    ("onchain.reachable_chain_count",          ("onchain", "reachable_chain_count"),            True),
     ("docs.pages_found",                      ("docs", "pages_found"),                         True),
     ("docs.broken_links",                     None,                                            False),  # special: len()
     ("console.agent_count",                   ("console", "agent_count"),                      True),
